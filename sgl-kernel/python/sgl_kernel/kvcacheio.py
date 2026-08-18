@@ -217,6 +217,117 @@ def transfer_kv_all_layer_direct_lf_pf(
     )
 
 
+def transfer_raw_h2d_batch(
+    dst_ptrs: torch.Tensor,
+    src_ptrs: torch.Tensor,
+    size_bytes: torch.Tensor,
+    device_id: int,
+):
+    torch.ops.sgl_kernel.transfer_raw_h2d_batch.default(
+        dst_ptrs, src_ptrs, size_bytes, device_id
+    )
+
+
+def write_mha_pages_to_fluxon_values(
+    plan_ptr: int,
+    page_indices: torch.Tensor,
+    k_layer_ptrs: torch.Tensor,
+    v_layer_ptrs: torch.Tensor,
+    k_page_bytes: int,
+    v_page_bytes: int,
+    device_id: int,
+):
+    torch.ops.sgl_kernel.write_mha_pages_to_fluxon_values.default(
+        plan_ptr,
+        page_indices,
+        k_layer_ptrs,
+        v_layer_ptrs,
+        k_page_bytes,
+        v_page_bytes,
+        device_id,
+    )
+
+
+def restore_mha_pages_from_fluxon_values(
+    plan_ptr: int,
+    page_indices: torch.Tensor,
+    k_layer_ptrs: torch.Tensor,
+    v_layer_ptrs: torch.Tensor,
+    k_page_bytes: int,
+    v_page_bytes: int,
+    device_id: int,
+):
+    torch.ops.sgl_kernel.restore_mha_pages_from_fluxon_values.default(
+        plan_ptr,
+        page_indices,
+        k_layer_ptrs,
+        v_layer_ptrs,
+        k_page_bytes,
+        v_page_bytes,
+        device_id,
+    )
+
+
+def write_mla_pages_to_fluxon_values(
+    plan_ptr: int,
+    page_indices: torch.Tensor,
+    layer_ptrs: torch.Tensor,
+    page_bytes: int,
+    device_id: int,
+):
+    torch.ops.sgl_kernel.write_mla_pages_to_fluxon_values.default(
+        plan_ptr, page_indices, layer_ptrs, page_bytes, device_id
+    )
+
+
+def restore_mla_pages_from_fluxon_values(
+    plan_ptr: int,
+    page_indices: torch.Tensor,
+    layer_ptrs: torch.Tensor,
+    page_bytes: int,
+    device_id: int,
+):
+    torch.ops.sgl_kernel.restore_mla_pages_from_fluxon_values.default(
+        plan_ptr, page_indices, layer_ptrs, page_bytes, device_id
+    )
+
+
+def write_mamba_state_to_fluxon_values(
+    plan_ptr: int,
+    slot_index: int,
+    state_layer_ptrs: torch.Tensor,
+    state_item_bytes: torch.Tensor,
+    layer_num: int,
+    device_id: int,
+):
+    torch.ops.sgl_kernel.write_mamba_state_to_fluxon_values.default(
+        plan_ptr,
+        slot_index,
+        state_layer_ptrs,
+        state_item_bytes,
+        layer_num,
+        device_id,
+    )
+
+
+def restore_mamba_state_from_fluxon_values(
+    plan_ptr: int,
+    slot_index: int,
+    state_layer_ptrs: torch.Tensor,
+    state_item_bytes: torch.Tensor,
+    layer_num: int,
+    device_id: int,
+):
+    torch.ops.sgl_kernel.restore_mamba_state_from_fluxon_values.default(
+        plan_ptr,
+        slot_index,
+        state_layer_ptrs,
+        state_item_bytes,
+        layer_num,
+        device_id,
+    )
+
+
 def transfer_kv_per_layer_mla(
     src: torch.Tensor,
     dst: torch.Tensor,

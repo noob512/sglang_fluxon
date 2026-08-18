@@ -636,6 +636,60 @@ void transfer_kv_all_layer_direct_lf_pf(
     const at::Tensor& dst_indices,
     int64_t page_size);
 
+void transfer_raw_h2d_batch(
+    const at::Tensor dst_ptrs,
+    const at::Tensor src_ptrs,
+    const at::Tensor size_bytes,
+    int64_t device_id);
+
+void write_mha_pages_to_fluxon_values(
+    int64_t plan_ptr,
+    const at::Tensor page_indices,
+    const at::Tensor k_layer_ptrs,
+    const at::Tensor v_layer_ptrs,
+    int64_t k_page_bytes,
+    int64_t v_page_bytes,
+    int64_t device_id);
+
+void restore_mha_pages_from_fluxon_values(
+    int64_t plan_ptr,
+    const at::Tensor page_indices,
+    const at::Tensor k_layer_ptrs,
+    const at::Tensor v_layer_ptrs,
+    int64_t k_page_bytes,
+    int64_t v_page_bytes,
+    int64_t device_id);
+
+void write_mla_pages_to_fluxon_values(
+    int64_t plan_ptr,
+    const at::Tensor page_indices,
+    const at::Tensor layer_ptrs,
+    int64_t page_bytes,
+    int64_t device_id);
+
+void restore_mla_pages_from_fluxon_values(
+    int64_t plan_ptr,
+    const at::Tensor page_indices,
+    const at::Tensor layer_ptrs,
+    int64_t page_bytes,
+    int64_t device_id);
+
+void write_mamba_state_to_fluxon_values(
+    int64_t plan_ptr,
+    int64_t slot_index,
+    const at::Tensor state_layer_ptrs,
+    const at::Tensor state_item_bytes,
+    int64_t layer_num,
+    int64_t device_id);
+
+void restore_mamba_state_from_fluxon_values(
+    int64_t plan_ptr,
+    int64_t slot_index,
+    const at::Tensor state_layer_ptrs,
+    const at::Tensor state_item_bytes,
+    int64_t layer_num,
+    int64_t device_id);
+
 /*
  * From csrc/memory
  */

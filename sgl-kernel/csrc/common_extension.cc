@@ -341,6 +341,35 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "transfer_kv_all_layer_direct_lf_pf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
       "Tensor dst_indices, int page_size) ->() ");
   m.impl("transfer_kv_all_layer_direct_lf_pf", torch::kCUDA, &transfer_kv_all_layer_direct_lf_pf);
+  m.def("transfer_raw_h2d_batch(Tensor dst_ptrs, Tensor src_ptrs, Tensor size_bytes, int device_id) -> ()");
+  // Raw descriptors are CPU tensors on the validated Fluxon GDR-off path.
+  // The implementation still submits cudaMemcpyAsync on the selected device.
+  m.impl("transfer_raw_h2d_batch", torch::kCPU, &transfer_raw_h2d_batch);
+  m.impl("transfer_raw_h2d_batch", torch::kCUDA, &transfer_raw_h2d_batch);
+  m.def(
+      "write_mha_pages_to_fluxon_values(int plan_ptr, Tensor page_indices, Tensor k_layer_ptrs, "
+      "Tensor v_layer_ptrs, int k_page_bytes, int v_page_bytes, int device_id) -> ()");
+  m.impl("write_mha_pages_to_fluxon_values", torch::kCUDA, &write_mha_pages_to_fluxon_values);
+  m.def(
+      "restore_mha_pages_from_fluxon_values(int plan_ptr, Tensor page_indices, Tensor k_layer_ptrs, "
+      "Tensor v_layer_ptrs, int k_page_bytes, int v_page_bytes, int device_id) -> ()");
+  m.impl("restore_mha_pages_from_fluxon_values", torch::kCUDA, &restore_mha_pages_from_fluxon_values);
+  m.def(
+      "write_mla_pages_to_fluxon_values(int plan_ptr, Tensor page_indices, Tensor layer_ptrs, "
+      "int page_bytes, int device_id) -> ()");
+  m.impl("write_mla_pages_to_fluxon_values", torch::kCUDA, &write_mla_pages_to_fluxon_values);
+  m.def(
+      "restore_mla_pages_from_fluxon_values(int plan_ptr, Tensor page_indices, Tensor layer_ptrs, "
+      "int page_bytes, int device_id) -> ()");
+  m.impl("restore_mla_pages_from_fluxon_values", torch::kCUDA, &restore_mla_pages_from_fluxon_values);
+  m.def(
+      "write_mamba_state_to_fluxon_values(int plan_ptr, int slot_index, Tensor state_layer_ptrs, "
+      "Tensor state_item_bytes, int layer_num, int device_id) -> ()");
+  m.impl("write_mamba_state_to_fluxon_values", torch::kCUDA, &write_mamba_state_to_fluxon_values);
+  m.def(
+      "restore_mamba_state_from_fluxon_values(int plan_ptr, int slot_index, Tensor state_layer_ptrs, "
+      "Tensor state_item_bytes, int layer_num, int device_id) -> ()");
+  m.impl("restore_mamba_state_from_fluxon_values", torch::kCUDA, &restore_mamba_state_from_fluxon_values);
 
   /*
    * From csrc/memory

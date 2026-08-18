@@ -1,5 +1,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/util/irange.h>
 #include <cuda_runtime.h>
 
@@ -986,4 +987,294 @@ void transfer_kv_all_layer_direct_lf_pf(
     const at::Tensor& dst_indices,
     int64_t page_size) {
   transfer_kv_page_first_direct_impl<true>(src_ptrs, dst_ptrs, src_indices, dst_indices, 0, page_size);
+}
+
+namespace {
+
+constexpr uint64_t kFluxonPlanBlobMagic = 0x4658504C414E5631ULL;
+
+struct FluxonPlanBlobView {
+  int64_t value_count;
+  const uint64_t* value_ptrs;
+};
+
+FluxonPlanBlobView fluxon_plan_blob(int64_t plan_ptr, int64_t expected_values) {
+  TORCH_CHECK(plan_ptr > 0, "Fluxon plan pointer must be positive");
+  const auto* words = reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(plan_ptr));
+  TORCH_CHECK(words[0] == kFluxonPlanBlobMagic, "Fluxon plan blob has an invalid magic value");
+  TORCH_CHECK(words[1] <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()), "Fluxon plan count overflows int64");
+  const int64_t value_count = static_cast<int64_t>(words[1]);
+  TORCH_CHECK(
+      value_count == expected_values,
+      "Fluxon plan/value count mismatch: expected ",
+      expected_values,
+      ", got ",
+      value_count);
+  for (int64_t index = 0; index < value_count; ++index) {
+    TORCH_CHECK(words[index + 2] != 0, "Fluxon plan contains a null value pointer at index ", index);
+  }
+  return {value_count, words + 2};
+}
+
+std::vector<int64_t> fluxon_i64_values(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.defined(), name, " must be defined");
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name, " must have dtype torch.int64");
+  at::Tensor cpu = tensor.contiguous().cpu();
+  const auto* values = cpu.data_ptr<int64_t>();
+  return std::vector<int64_t>(values, values + cpu.numel());
+}
+
+cudaStream_t fluxon_stream(int64_t device_id) {
+  TORCH_CHECK(device_id >= 0, "Fluxon CUDA device id must be non-negative");
+  return at::cuda::getCurrentCUDAStream(static_cast<c10::DeviceIndex>(device_id));
+}
+
+void fluxon_copy_async(
+    uintptr_t dst,
+    uintptr_t src,
+    int64_t size_bytes,
+    cudaStream_t stream,
+    const char* operation) {
+  TORCH_CHECK(dst != 0, operation, " has a null destination pointer");
+  TORCH_CHECK(src != 0, operation, " has a null source pointer");
+  TORCH_CHECK(size_bytes > 0, operation, " requires a positive copy size");
+  C10_CUDA_CHECK(cudaMemcpyAsync(
+      reinterpret_cast<void*>(dst),
+      reinterpret_cast<const void*>(src),
+      static_cast<size_t>(size_bytes),
+      cudaMemcpyDefault,
+      stream));
+}
+
+}  // namespace
+
+void transfer_raw_h2d_batch(
+    const at::Tensor dst_ptrs,
+    const at::Tensor src_ptrs,
+    const at::Tensor size_bytes,
+    int64_t device_id) {
+  c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(device_id));
+  const auto destinations = fluxon_i64_values(dst_ptrs, "dst_ptrs");
+  const auto sources = fluxon_i64_values(src_ptrs, "src_ptrs");
+  const auto sizes = fluxon_i64_values(size_bytes, "size_bytes");
+  TORCH_CHECK(
+      destinations.size() == sources.size() && destinations.size() == sizes.size(),
+      "Fluxon raw H2D descriptor counts must match");
+  const cudaStream_t stream = fluxon_stream(device_id);
+  for (size_t index = 0; index < destinations.size(); ++index) {
+    fluxon_copy_async(
+        static_cast<uintptr_t>(destinations[index]),
+        static_cast<uintptr_t>(sources[index]),
+        sizes[index],
+        stream,
+        "Fluxon raw H2D copy");
+  }
+}
+
+void write_mha_pages_to_fluxon_values(
+    int64_t plan_ptr,
+    const at::Tensor page_indices,
+    const at::Tensor k_layer_ptrs,
+    const at::Tensor v_layer_ptrs,
+    int64_t k_page_bytes,
+    int64_t v_page_bytes,
+    int64_t device_id) {
+  c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(device_id));
+  const auto pages = fluxon_i64_values(page_indices, "page_indices");
+  const auto k_layers = fluxon_i64_values(k_layer_ptrs, "k_layer_ptrs");
+  const auto v_layers = fluxon_i64_values(v_layer_ptrs, "v_layer_ptrs");
+  TORCH_CHECK(!k_layers.empty(), "Fluxon MHA write requires at least one layer");
+  TORCH_CHECK(k_layers.size() == v_layers.size(), "Fluxon MHA K/V layer counts must match");
+  TORCH_CHECK(k_page_bytes > 0 && v_page_bytes > 0, "Fluxon MHA page sizes must be positive");
+  const auto plan = fluxon_plan_blob(plan_ptr, static_cast<int64_t>(pages.size()));
+  const cudaStream_t stream = fluxon_stream(device_id);
+  const uintptr_t v_offset = k_layers.size() * static_cast<uintptr_t>(k_page_bytes);
+  for (size_t page = 0; page < pages.size(); ++page) {
+    TORCH_CHECK(pages[page] >= 0, "Fluxon MHA page indices must be non-negative");
+    const uintptr_t value = static_cast<uintptr_t>(plan.value_ptrs[page]);
+    for (size_t layer = 0; layer < k_layers.size(); ++layer) {
+      fluxon_copy_async(
+          value + layer * static_cast<uintptr_t>(k_page_bytes),
+          static_cast<uintptr_t>(k_layers[layer]) +
+              static_cast<uintptr_t>(pages[page]) * static_cast<uintptr_t>(k_page_bytes),
+          k_page_bytes,
+          stream,
+          "Fluxon MHA K write");
+      fluxon_copy_async(
+          value + v_offset + layer * static_cast<uintptr_t>(v_page_bytes),
+          static_cast<uintptr_t>(v_layers[layer]) +
+              static_cast<uintptr_t>(pages[page]) * static_cast<uintptr_t>(v_page_bytes),
+          v_page_bytes,
+          stream,
+          "Fluxon MHA V write");
+    }
+  }
+}
+
+void restore_mha_pages_from_fluxon_values(
+    int64_t plan_ptr,
+    const at::Tensor page_indices,
+    const at::Tensor k_layer_ptrs,
+    const at::Tensor v_layer_ptrs,
+    int64_t k_page_bytes,
+    int64_t v_page_bytes,
+    int64_t device_id) {
+  c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(device_id));
+  const auto pages = fluxon_i64_values(page_indices, "page_indices");
+  const auto k_layers = fluxon_i64_values(k_layer_ptrs, "k_layer_ptrs");
+  const auto v_layers = fluxon_i64_values(v_layer_ptrs, "v_layer_ptrs");
+  TORCH_CHECK(!k_layers.empty(), "Fluxon MHA restore requires at least one layer");
+  TORCH_CHECK(k_layers.size() == v_layers.size(), "Fluxon MHA K/V layer counts must match");
+  TORCH_CHECK(k_page_bytes > 0 && v_page_bytes > 0, "Fluxon MHA page sizes must be positive");
+  const auto plan = fluxon_plan_blob(plan_ptr, static_cast<int64_t>(pages.size()));
+  const cudaStream_t stream = fluxon_stream(device_id);
+  const uintptr_t v_offset = k_layers.size() * static_cast<uintptr_t>(k_page_bytes);
+  for (size_t page = 0; page < pages.size(); ++page) {
+    TORCH_CHECK(pages[page] >= 0, "Fluxon MHA page indices must be non-negative");
+    const uintptr_t value = static_cast<uintptr_t>(plan.value_ptrs[page]);
+    for (size_t layer = 0; layer < k_layers.size(); ++layer) {
+      fluxon_copy_async(
+          static_cast<uintptr_t>(k_layers[layer]) +
+              static_cast<uintptr_t>(pages[page]) * static_cast<uintptr_t>(k_page_bytes),
+          value + layer * static_cast<uintptr_t>(k_page_bytes),
+          k_page_bytes,
+          stream,
+          "Fluxon MHA K restore");
+      fluxon_copy_async(
+          static_cast<uintptr_t>(v_layers[layer]) +
+              static_cast<uintptr_t>(pages[page]) * static_cast<uintptr_t>(v_page_bytes),
+          value + v_offset + layer * static_cast<uintptr_t>(v_page_bytes),
+          v_page_bytes,
+          stream,
+          "Fluxon MHA V restore");
+    }
+  }
+}
+
+void write_mla_pages_to_fluxon_values(
+    int64_t plan_ptr,
+    const at::Tensor page_indices,
+    const at::Tensor layer_ptrs,
+    int64_t page_bytes,
+    int64_t device_id) {
+  c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(device_id));
+  const auto pages = fluxon_i64_values(page_indices, "page_indices");
+  const auto layers = fluxon_i64_values(layer_ptrs, "layer_ptrs");
+  TORCH_CHECK(!layers.empty(), "Fluxon MLA write requires at least one layer");
+  TORCH_CHECK(page_bytes > 0, "Fluxon MLA page size must be positive");
+  const auto plan = fluxon_plan_blob(plan_ptr, static_cast<int64_t>(pages.size()));
+  const cudaStream_t stream = fluxon_stream(device_id);
+  for (size_t page = 0; page < pages.size(); ++page) {
+    TORCH_CHECK(pages[page] >= 0, "Fluxon MLA page indices must be non-negative");
+    const uintptr_t value = static_cast<uintptr_t>(plan.value_ptrs[page]);
+    for (size_t layer = 0; layer < layers.size(); ++layer) {
+      fluxon_copy_async(
+          value + layer * static_cast<uintptr_t>(page_bytes),
+          static_cast<uintptr_t>(layers[layer]) +
+              static_cast<uintptr_t>(pages[page]) * static_cast<uintptr_t>(page_bytes),
+          page_bytes,
+          stream,
+          "Fluxon MLA write");
+    }
+  }
+}
+
+void restore_mla_pages_from_fluxon_values(
+    int64_t plan_ptr,
+    const at::Tensor page_indices,
+    const at::Tensor layer_ptrs,
+    int64_t page_bytes,
+    int64_t device_id) {
+  c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(device_id));
+  const auto pages = fluxon_i64_values(page_indices, "page_indices");
+  const auto layers = fluxon_i64_values(layer_ptrs, "layer_ptrs");
+  TORCH_CHECK(!layers.empty(), "Fluxon MLA restore requires at least one layer");
+  TORCH_CHECK(page_bytes > 0, "Fluxon MLA page size must be positive");
+  const auto plan = fluxon_plan_blob(plan_ptr, static_cast<int64_t>(pages.size()));
+  const cudaStream_t stream = fluxon_stream(device_id);
+  for (size_t page = 0; page < pages.size(); ++page) {
+    TORCH_CHECK(pages[page] >= 0, "Fluxon MLA page indices must be non-negative");
+    const uintptr_t value = static_cast<uintptr_t>(plan.value_ptrs[page]);
+    for (size_t layer = 0; layer < layers.size(); ++layer) {
+      fluxon_copy_async(
+          static_cast<uintptr_t>(layers[layer]) +
+              static_cast<uintptr_t>(pages[page]) * static_cast<uintptr_t>(page_bytes),
+          value + layer * static_cast<uintptr_t>(page_bytes),
+          page_bytes,
+          stream,
+          "Fluxon MLA restore");
+    }
+  }
+}
+
+void write_mamba_state_to_fluxon_values(
+    int64_t plan_ptr,
+    int64_t slot_index,
+    const at::Tensor state_layer_ptrs,
+    const at::Tensor state_item_bytes,
+    int64_t layer_num,
+    int64_t device_id) {
+  c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(device_id));
+  TORCH_CHECK(slot_index >= 0, "Fluxon Mamba slot index must be non-negative");
+  TORCH_CHECK(layer_num > 0, "Fluxon Mamba layer count must be positive");
+  const auto layer_ptrs = fluxon_i64_values(state_layer_ptrs, "state_layer_ptrs");
+  const auto item_bytes = fluxon_i64_values(state_item_bytes, "state_item_bytes");
+  TORCH_CHECK(!item_bytes.empty(), "Fluxon Mamba write requires at least one state tensor");
+  TORCH_CHECK(
+      layer_ptrs.size() == item_bytes.size() * static_cast<size_t>(layer_num),
+      "Fluxon Mamba state pointer geometry is invalid");
+  const auto plan = fluxon_plan_blob(plan_ptr, 1);
+  const cudaStream_t stream = fluxon_stream(device_id);
+  const uintptr_t value = static_cast<uintptr_t>(plan.value_ptrs[0]);
+  uintptr_t value_offset = 0;
+  for (size_t state = 0; state < item_bytes.size(); ++state) {
+    TORCH_CHECK(item_bytes[state] > 0, "Fluxon Mamba state item sizes must be positive");
+    for (int64_t layer = 0; layer < layer_num; ++layer) {
+      const size_t pointer_index = state * static_cast<size_t>(layer_num) + layer;
+      fluxon_copy_async(
+          value + value_offset,
+          static_cast<uintptr_t>(layer_ptrs[pointer_index]) +
+              static_cast<uintptr_t>(slot_index) * static_cast<uintptr_t>(item_bytes[state]),
+          item_bytes[state],
+          stream,
+          "Fluxon Mamba write");
+      value_offset += static_cast<uintptr_t>(item_bytes[state]);
+    }
+  }
+}
+
+void restore_mamba_state_from_fluxon_values(
+    int64_t plan_ptr,
+    int64_t slot_index,
+    const at::Tensor state_layer_ptrs,
+    const at::Tensor state_item_bytes,
+    int64_t layer_num,
+    int64_t device_id) {
+  c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(device_id));
+  TORCH_CHECK(slot_index >= 0, "Fluxon Mamba slot index must be non-negative");
+  TORCH_CHECK(layer_num > 0, "Fluxon Mamba layer count must be positive");
+  const auto layer_ptrs = fluxon_i64_values(state_layer_ptrs, "state_layer_ptrs");
+  const auto item_bytes = fluxon_i64_values(state_item_bytes, "state_item_bytes");
+  TORCH_CHECK(!item_bytes.empty(), "Fluxon Mamba restore requires at least one state tensor");
+  TORCH_CHECK(
+      layer_ptrs.size() == item_bytes.size() * static_cast<size_t>(layer_num),
+      "Fluxon Mamba state pointer geometry is invalid");
+  const auto plan = fluxon_plan_blob(plan_ptr, 1);
+  const cudaStream_t stream = fluxon_stream(device_id);
+  const uintptr_t value = static_cast<uintptr_t>(plan.value_ptrs[0]);
+  uintptr_t value_offset = 0;
+  for (size_t state = 0; state < item_bytes.size(); ++state) {
+    TORCH_CHECK(item_bytes[state] > 0, "Fluxon Mamba state item sizes must be positive");
+    for (int64_t layer = 0; layer < layer_num; ++layer) {
+      const size_t pointer_index = state * static_cast<size_t>(layer_num) + layer;
+      fluxon_copy_async(
+          static_cast<uintptr_t>(layer_ptrs[pointer_index]) +
+              static_cast<uintptr_t>(slot_index) * static_cast<uintptr_t>(item_bytes[state]),
+          value + value_offset,
+          item_bytes[state],
+          stream,
+          "Fluxon Mamba restore");
+      value_offset += static_cast<uintptr_t>(item_bytes[state]);
+    }
+  }
 }
