@@ -566,9 +566,9 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertEqual(adder._swa_budget_for_req(extend), expected)
 
-    def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
-        # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise
-        # the fix would regress non-SWA models.
+    def test_add_chunked_req_non_hybrid_reserves_full_kv_page(self):
+        # Non-hybrid Full KV does not use the SWA-pool bound, but alloc_extend
+        # still needs the generic one-page physical-capacity reservation.
         PAGE_SIZE = 16
         adder, req = self._build_hybrid_swa_chunked_req(
             page_size=PAGE_SIZE,
@@ -576,13 +576,91 @@ class TestPrefillAdder(CustomTestCase):
             rem_chunk=500,
             extend_input_len=200,
             is_hybrid_swa=False,
-            full_available=300,
+            full_available=400,
         )
 
         result = adder.add_chunked_req(req)
         self.assertIsNone(result)
         req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
+
+    def test_add_chunked_req_non_hybrid_parks_when_only_one_page_is_free(self):
+        # Regression for the Fluxon K1-MT failure: after a large load-back and
+        # one 8192-token chunk, the device allocator had exactly one 64-token
+        # page left.  The old fallback ignored the exhausted budget and sent
+        # the final 501 tokens to alloc_extend, terminating the scheduler.
+        PAGE_SIZE = 64
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=PAGE_SIZE,
+            rem_swa=100_000,
+            rem_chunk=8192,
+            extend_input_len=501,
+            is_hybrid_swa=False,
+            full_available=PAGE_SIZE,
+        )
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIs(result, req)
+        req.set_extend_range.assert_not_called()
+        self.assertEqual(len(adder.can_run_list), 0)
+
+    def test_add_chunked_req_non_hybrid_caps_to_page_safe_headroom(self):
+        PAGE_SIZE = 64
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=PAGE_SIZE,
+            rem_swa=100_000,
+            rem_chunk=8192,
+            extend_input_len=501,
+            is_hybrid_swa=False,
+            full_available=565,
+        )
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIs(result, req)
+        req.set_extend_range.assert_called_once_with(0, 448)
+        self.assertIn(req, adder.can_run_list)
+        self.assertLessEqual(adder.cur_rem_token_offset, 565)
+
+    def test_add_chunked_req_non_hybrid_stays_chunked_without_decode_reserve(self):
+        # The prompt itself fits under 640 tokens, but completing it would also
+        # charge 128 decode tokens and one allocator page: 512 + 128 + 64.
+        # Keep a strict chunk boundary instead of over-committing that reserve.
+        PAGE_SIZE = 64
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=PAGE_SIZE,
+            rem_swa=100_000,
+            rem_chunk=8192,
+            extend_input_len=501,
+            is_hybrid_swa=False,
+            full_available=640,
+        )
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIs(result, req)
+        req.set_extend_range.assert_called_once_with(0, 448)
+        self.assertIn(req, adder.can_run_list)
+        self.assertLessEqual(adder.cur_rem_token_offset, 640)
+
+    def test_add_chunked_req_non_hybrid_finishes_with_full_decode_reserve(self):
+        PAGE_SIZE = 64
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=PAGE_SIZE,
+            rem_swa=100_000,
+            rem_chunk=8192,
+            extend_input_len=501,
+            is_hybrid_swa=False,
+            full_available=800,
+        )
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIsNone(result)
+        req.set_extend_range.assert_called_once_with(0, 501)
+        self.assertIn(req, adder.can_run_list)
+        self.assertLessEqual(adder.cur_rem_token_offset, 800)
 
 
 if __name__ == "__main__":

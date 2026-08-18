@@ -704,26 +704,61 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
+            req.prefix_indices
+        )
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
-            _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+            # A resumed request has two safe outcomes. It can finish only when
+            # the paged prompt, decode reserve, and alloc_extend overhead all
+            # fit. Otherwise it must remain strictly chunked, so max_new_tokens
+            # is not charged until a later round with enough headroom.
+            rem_total_tokens = int(self.rem_total_tokens)
+            allocatable_extend_tokens = (
+                max(0, rem_total_tokens - self.page_size)
+                // self.page_size
+                * self.page_size
+            )
+            completion_max_new_tokens = min(
+                req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+            )
+            completion_required_tokens = (
+                self.ceil_paged_tokens(cand_extend_input_len)
+                + completion_max_new_tokens
+                + self.page_size
+            )
+            can_finish = (
+                cand_extend_input_len <= self.rem_chunk_tokens
+                and completion_required_tokens < rem_total_tokens
+            )
+            if can_finish:
+                _rem_tokens = cand_extend_input_len
+            else:
+                strictly_truncated_tokens = (
+                    max(0, cand_extend_input_len - 1)
+                    // self.page_size
+                    * self.page_size
+                )
+                _rem_tokens = min(
+                    self.rem_chunk_tokens,
+                    allocatable_extend_tokens,
+                    strictly_truncated_tokens,
+                )
             if self.is_hybrid_swa:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
-            # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
-            # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
+            # Keep the request parked until decode completion or eviction
+            # creates real allocator headroom.  The scheduler retains
+            # ``chunked_req`` and retries it; adding it with a fabricated
+            # budget would turn ordinary backpressure into a fatal prefill
+            # OOM.  This is the same lifecycle already used by hybrid SWA.
             if _rem_tokens <= 0:
-                if self.is_hybrid_swa:
-                    return req
-                _rem_tokens = self.rem_chunk_tokens
+                return req
 
-        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
-            req.prefix_indices
-        )
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
