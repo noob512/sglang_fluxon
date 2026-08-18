@@ -9,7 +9,7 @@ from typing import Optional
 import psutil
 import torch
 
-from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
@@ -97,6 +97,15 @@ class HostKVCache(abc.ABC):
         self.allocator = get_allocator_from_storage(allocator_type)
         self.can_use_write_back_jit = False
 
+        # Fluxon owns the L2/L3 payload. HostKV keeps logical slots only so the
+        # hostless path does not materialize a second copy of the KV cache.
+        self.metadata_only = str(allocator_type).lower() == "fluxon"
+        if self.metadata_only and not isinstance(device_pool, MHATokenToKVPool):
+            raise ValueError(
+                "Fluxon metadata-only HostKV currently supports only "
+                f"MHATokenToKVPool, got {type(device_pool).__name__}"
+            )
+
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
@@ -115,18 +124,24 @@ class HostKVCache(abc.ABC):
             self.size > device_pool.size
         ), "The host memory should be larger than the device memory with the current protocol"
 
-        # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
+        if self.metadata_only:
+            logger.warning(
+                "Fluxon metadata-only HostKV enabled: logical_tokens=%d "
+                "logical_bytes=%.2f GB materialized_pages=1",
+                self.size,
+                requested_bytes / 1e9,
             )
         else:
+            host_mem = psutil.virtual_memory()
+            available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+            if requested_bytes > available_bytes:
+                raise ValueError(
+                    f"Not enough host memory available. Requesting "
+                    f"{requested_bytes / 1e9:.2f} GB but only have "
+                    f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                    f"size of the hierarchical cache."
+                )
             logger.info(
                 f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
             )
@@ -136,6 +151,13 @@ class HostKVCache(abc.ABC):
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
+
+    def _require_materialized_host_data(self, api_name: str) -> None:
+        if self.metadata_only:
+            raise RuntimeError(
+                f"{api_name} cannot access HostKV data in Fluxon metadata-only "
+                "mode; use the storage-backed hostless path"
+            )
 
     def destroy(self):
         """Unregister pinned host buffers in userspace before process exit.

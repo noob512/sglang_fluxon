@@ -146,14 +146,16 @@ class MHATokenToKVPoolHost(HostKVCache):
         return self.get_size_per_token() // 2
 
     def init_kv_buffer(self):
+        physical_size = self.page_size if self.metadata_only else self.size
+        physical_page_num = 1 if self.metadata_only else self.page_num
         if self.layout == "layer_first":
-            dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
+            dims = (2, self.layer_num, physical_size, self.head_num, self.head_dim)
         elif self.layout == "page_first":
-            dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
+            dims = (2, physical_size, self.layer_num, self.head_num, self.head_dim)
         elif self.layout == "page_first_direct":
             dims = (
                 2,
-                self.page_num,
+                physical_page_num,
                 self.layer_num,
                 self.page_size,
                 self.head_num,
@@ -162,7 +164,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         elif self.layout == "page_head":
             dims = (
                 2,
-                self.page_num,
+                physical_page_num,
                 self.head_num,
                 self.page_size,
                 self.layer_num,
@@ -189,7 +191,11 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.staging_k_buffer = None
         self.staging_v_buffer = None
         self.can_use_write_back_jit = False
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.metadata_only
+            or self.layout != "page_first"
+            or (_is_npu or _is_xpu or _is_mps)
+        ):
             return
 
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
@@ -228,6 +234,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         layer_id,
         io_backend,
     ):
+        self._require_materialized_host_data("load_to_device_per_layer")
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -340,6 +347,7 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        self._require_materialized_host_data("backup_from_device_all_layer")
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -443,6 +451,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        self._require_materialized_host_data("get_data_page")
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, :, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
@@ -457,6 +466,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
+        self._require_materialized_host_data("get_dummy_flat_data_page")
         return torch.zeros(
             (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
             dtype=self.dtype,
@@ -465,6 +475,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        self._require_materialized_host_data("set_from_flat_data_page")
         if self.layout == "layer_first":
             self.kv_buffer[:, :, index : index + self.page_size, :, :] = (
                 data_page.reshape(
@@ -504,6 +515,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         """
         get meta data for zero copy of heterogeneous ranks' KVCache
         """
+        self._require_materialized_host_data("get_split_heads_page_buffer_meta")
         assert self.layout == "page_head"
         assert len(indices) % self.page_size == 0
         assert self.head_num % split_factor == 0
@@ -550,6 +562,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         """
         meta data for zero copy
         """
+        self._require_materialized_host_data("get_page_buffer_meta")
         assert len(indices) % self.page_size == 0
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
@@ -620,6 +633,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
         stride must itself be a multiple of the OS page size.
         """
+        if self.metadata_only:
+            return False
         if self.layout not in ("page_first", "page_first_direct", "page_head"):
             return False
         stride = (
