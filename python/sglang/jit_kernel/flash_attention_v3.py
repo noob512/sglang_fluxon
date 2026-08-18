@@ -17,28 +17,14 @@ DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
 def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
-    call_kwargs = dict(kwargs)
-    if out is not None:
-        call_kwargs["out"] = out
-
-    while True:
-        try:
-            return kernel(*args, **call_kwargs)
-        except TypeError as exc:
-            message = str(exc)
-            if (
-                "unexpected keyword argument 'only_qv'" in message
-                and call_kwargs.get("only_qv") is False
-            ):
-                # Older sgl_kernel wheels predate only_qv. Omitting a disabled
-                # flag is behaviorally equivalent; an enabled flag must still
-                # fail instead of silently selecting the wrong attention path.
-                call_kwargs.pop("only_qv")
-                continue
-            if "unexpected keyword argument 'out'" in message and "out" in call_kwargs:
-                call_kwargs.pop("out")
-                continue
+    if out is None:
+        return kernel(*args, **kwargs)
+    try:
+        return kernel(*args, **kwargs, out=out)
+    except TypeError as exc:
+        if "unexpected keyword argument 'out'" not in str(exc):
             raise
+        return kernel(*args, **kwargs)
 
 
 @cache_once

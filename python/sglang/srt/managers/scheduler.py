@@ -2280,45 +2280,26 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             last_host_node = req.last_host_node
-            # L3 is a best-effort lookup for every eligible prefill. The local
-            # radix result selects the hash anchor, but no longer gates whether
-            # storage is queried. The storage layer still enforces its own
-            # minimum lookup length and rate limit.
-            last_hash = last_host_node.get_last_hash_value()
-            matched_len = len(req.prefix_indices) + req.host_hit_length
-            match_end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
-            new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
+            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
+                last_hash = last_host_node.get_last_hash_value()
+                matched_len = len(req.prefix_indices) + req.host_hit_length
+                match_end = req._compute_max_prefix_len(
+                    len(req.full_untruncated_fill_ids)
+                )
+                new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
 
-            prefix_keys = (
-                last_host_node.get_prefix_hash_values(last_host_node.parent)
-                if self.tree_cache.hicache_storage_pass_prefix_keys
-                else None
-            )
-            if self.server_args.hicache_storage_backend == "fluxon":
-                waiting_uncached_tokens = sum(
-                    max(
-                        0,
-                        waiting_req.seqlen - len(waiting_req.prefix_indices),
-                    )
-                    for waiting_req in self.waiting_queue
+                prefix_keys = (
+                    last_host_node.get_prefix_hash_values(last_host_node.parent)
+                    if self.tree_cache.hicache_storage_pass_prefix_keys
+                    else None
                 )
-                self.tree_cache.observe_fluxon_prefetch_scheduler_state(
+                self.tree_cache.prefetch_from_storage(
                     req.rid,
-                    phase="enqueue",
-                    queue_position=len(self.waiting_queue),
-                    queue_length=len(self.waiting_queue) + 1,
-                    pending_tokens=(
-                        self.load_inquirer._get_num_pending_tokens() + req.seqlen
-                    ),
-                    uncached_tokens=waiting_uncached_tokens + len(new_input_tokens),
+                    last_host_node,
+                    new_input_tokens,
+                    last_hash,
+                    prefix_keys,
                 )
-            self.tree_cache.prefetch_from_storage(
-                req.rid,
-                last_host_node,
-                new_input_tokens,
-                last_hash,
-                prefix_keys,
-            )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -2876,12 +2857,7 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
-        scheduler_pending_tokens = self.load_inquirer._get_num_pending_tokens()
-        scheduler_uncached_tokens = sum(
-            max(0, waiting_req.seqlen - len(waiting_req.prefix_indices))
-            for waiting_req in self.waiting_queue
-        )
-        for queue_position, req in enumerate(self.waiting_queue):
+        for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -2902,22 +2878,13 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                if self.server_args.hicache_storage_backend == "fluxon":
-                    self.tree_cache.observe_fluxon_prefetch_scheduler_state(
-                        req.rid,
-                        phase="consume",
-                        queue_position=queue_position,
-                        queue_length=len(self.waiting_queue),
-                        pending_tokens=scheduler_pending_tokens,
-                        uncached_tokens=scheduler_uncached_tokens,
-                    )
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
-                req.record_storage_hit_tokens(
-                    self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
+                    req.rid
                 )
 
             req.init_next_round_input(self.tree_cache)

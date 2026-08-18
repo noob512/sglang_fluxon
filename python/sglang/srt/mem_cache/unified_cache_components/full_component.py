@@ -50,18 +50,15 @@ class FullComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
-        contiguous = True
-
-        def validator(node: UnifiedTreeNode) -> bool:
-            nonlocal contiguous
-            cd = node.component_data[self.component_type]
-            present = cd.value is not None or (
-                not match_device_only and cd.host_value is not None
+        if match_device_only:
+            return (
+                lambda node: node.component_data[self.component_type].value is not None
             )
-            contiguous = contiguous and present
-            return contiguous
 
-        return validator
+        # HiCache: evicted + backuped nodes are valid match boundaries.
+        return lambda node: (
+            node.component_data[self.component_type].value is not None or node.backuped
+        )
 
     def finalize_match_result(
         self,
@@ -198,7 +195,6 @@ class FullComponent(TreeComponent):
         while cur is not root and cur.component_data[ct].value is None:
             result.skip_lock_node_ids.setdefault(ct, set()).add(cur.id)
             cur = cur.parent
-        result.device_lock_start_nodes[ct] = cur
 
         # Lock the device-on segment up to root
         delta = 0
@@ -235,20 +231,14 @@ class FullComponent(TreeComponent):
 
         root = self.cache.root_node
         skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
-        cur = (
-            params.device_lock_start_nodes.get(ct, node) if params is not None else node
-        )
+        cur = node
         while cur != root:
             if cur.id in skip_lock_node_ids:
                 cur = cur.parent
                 continue
             cd = cur.component_data[ct]
             assert cd.value is not None
-            assert cd.lock_ref > 0, (
-                "FULL lock release without matching acquire: "
-                f"release_node={node.id} current_node={cur.id} "
-                f"skip_node_ids={sorted(skip_lock_node_ids)}"
-            )
+            assert cd.lock_ref > 0
 
             if cd.lock_ref == 1:
                 key_len = len(cd.value)

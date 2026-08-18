@@ -7,8 +7,6 @@ use http::header::HeaderName;
 
 static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
-static HEADER_SESSION_FIRST_REQUEST: HeaderName =
-    HeaderName::from_static("x-smg-session-first-request");
 
 fn extract_header_value<'a>(headers: Option<&'a HeaderMap>, name: &HeaderName) -> Option<&'a str> {
     headers
@@ -23,15 +21,6 @@ pub fn extract_target_worker(headers: Option<&HeaderMap>) -> Option<&str> {
 
 pub fn extract_routing_key(headers: Option<&HeaderMap>) -> Option<&str> {
     extract_header_value(headers, &HEADER_ROUTING_KEY)
-}
-
-/// Return whether the client explicitly marked this as the first request in a session.
-///
-/// This is a router-only scheduling hint. It lets cache-aware routing bypass a shared
-/// system-prefix match for a new session without keeping a second session-state table.
-pub fn is_session_first_request(headers: Option<&HeaderMap>) -> bool {
-    extract_header_value(headers, &HEADER_SESSION_FIRST_REQUEST)
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 /// Copy request headers to a Vec of name-value string pairs
@@ -272,24 +261,6 @@ mod tests {
     }
 
     #[test]
-    fn test_session_first_request_hint() {
-        for value in ["1", "true", "TRUE"] {
-            let mut headers = HeaderMap::new();
-            headers.insert("x-smg-session-first-request", value.parse().unwrap());
-            assert!(is_session_first_request(Some(&headers)));
-        }
-
-        for value in ["0", "false", "unexpected", ""] {
-            let mut headers = HeaderMap::new();
-            headers.insert("x-smg-session-first-request", value.parse().unwrap());
-            assert!(!is_session_first_request(Some(&headers)));
-        }
-
-        assert!(!is_session_first_request(Some(&HeaderMap::new())));
-        assert!(!is_session_first_request(None));
-    }
-
-    #[test]
     fn test_should_forward_request_header_whitelist() {
         assert!(should_forward_request_header("authorization"));
         assert!(should_forward_request_header("Authorization"));
@@ -324,8 +295,5 @@ mod tests {
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
         assert!(!should_forward_request_header("x-api-key"));
-        assert!(!should_forward_request_header(
-            "x-smg-session-first-request"
-        ));
     }
 }

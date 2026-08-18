@@ -71,10 +71,7 @@ use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
     CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::{
-    core::{Worker, WorkerType, UNKNOWN_MODEL_ID},
-    routers::header_utils::is_session_first_request,
-};
+use crate::core::{Worker, WorkerType, UNKNOWN_MODEL_ID};
 
 /// Tag used to isolate prefill/decode/regular worker pools in the cache_aware tree key.
 ///
@@ -400,22 +397,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
-        // A client that knows session boundaries can explicitly force the first request
-        // through shortest-queue routing. Without this hint, a shared system prompt can
-        // make unrelated new sessions look like cache hits and herd them onto one worker.
-        let session_first_request = is_session_first_request(info.headers);
-
         // Check if load is imbalanced
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
-        if session_first_request || is_imbalanced {
-            if session_first_request {
-                debug!(
-                    "Session-first request forced shortest-queue routing | max: {} | min: {}",
-                    max_load, min_load
-                );
-            }
+        if is_imbalanced {
             return self.select_worker_min_load(
                 workers,
                 &request_text,
@@ -654,71 +640,6 @@ mod tests {
             let idx = policy.select_worker(&workers, &info).await.unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
-    }
-
-    #[tokio::test]
-    async fn test_session_first_request_bypasses_shared_prefix_affinity() {
-        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 64,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 0,
-            max_tree_size: 10000,
-        });
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
-        policy.init_workers(&workers);
-
-        let affinity_idx = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("shared-prefix/session-a"),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        workers[affinity_idx].increment_load();
-
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-smg-session-first-request", "true".parse().unwrap());
-        let first_idx = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("shared-prefix/session-b"),
-                    headers: Some(&headers),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_ne!(first_idx, affinity_idx);
-
-        // The forced first request still updates the approximate tree, so its next
-        // causal turn returns to the worker selected by shortest queue.
-        let followup_idx = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("shared-prefix/session-b/follow-up"),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(followup_idx, first_idx);
     }
 
     #[tokio::test]
