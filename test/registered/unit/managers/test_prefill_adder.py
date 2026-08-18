@@ -34,11 +34,27 @@ class TestPrefillAdder(CustomTestCase):
         full_evictable_size: int = 0,
         swa_evictable_size: int = 0,
         evictable_size: int = 0,
+        full_reclaimable_size: int | None = None,
+        swa_reclaimable_size: int | None = None,
+        reclaimable_size: int | None = None,
     ) -> MagicMock:
         tree_cache = MagicMock()
         tree_cache.full_evictable_size.return_value = full_evictable_size
         tree_cache.swa_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
+        tree_cache.full_reclaimable_size.return_value = (
+            full_evictable_size
+            if full_reclaimable_size is None
+            else full_reclaimable_size
+        )
+        tree_cache.swa_reclaimable_size.return_value = (
+            swa_evictable_size
+            if swa_reclaimable_size is None
+            else swa_reclaimable_size
+        )
+        tree_cache.reclaimable_size.return_value = (
+            evictable_size if reclaimable_size is None else reclaimable_size
+        )
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
@@ -101,6 +117,19 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def test_budget_uses_reclaimable_not_raw_evictable_candidates(self):
+        self.mock_tree_cache = self.create_tree_cache(
+            evictable_size=100,
+            reclaimable_size=7,
+        )
+        self.mock_token_allocator = self.create_token_allocator(available_size=11)
+        adder = self.create_adder(self.create_running_batch())
+
+        self.assertEqual(adder.rem_total_tokens, 18)
+        self.assertEqual(adder.cur_rem_tokens, 18)
+        self.mock_tree_cache.reclaimable_size.assert_called()
+        self.mock_tree_cache.evictable_size.assert_not_called()
 
     def test_preempt_success_high_priority_values_first(self):
         params = [

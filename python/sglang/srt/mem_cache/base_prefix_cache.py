@@ -272,11 +272,26 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evictable_size(self):
         return 0
 
+    def reclaimable_size(self):
+        """Tokens that direct reclaim is guaranteed to return to the allocator.
+
+        This is deliberately separate from victim-policy bookkeeping. Cache
+        implementations that include pending or retry-only candidates in
+        evictable_size must override this method and exclude them.
+        """
+        return self.evictable_size()
+
     def full_evictable_size(self):
         return 0
 
+    def full_reclaimable_size(self):
+        return self.full_evictable_size()
+
     def swa_evictable_size(self):
         return 0
+
+    def swa_reclaimable_size(self):
+        return self.swa_evictable_size()
 
     def protected_size(self):
         return 0

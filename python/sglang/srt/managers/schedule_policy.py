@@ -518,49 +518,49 @@ class PrefillAdder:
     @property
     def rem_total_tokens(self):
         if self.is_hybrid_swa:
-            available_and_evictable = (
+            available_and_reclaimable = (
                 self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size()
+                + self.tree_cache.full_reclaimable_size()
             )
         elif self.is_hybrid_ssm_cache:
-            available_and_evictable = (
+            available_and_reclaimable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
+                + self.tree_cache.full_reclaimable_size()
             )
         else:
-            available_and_evictable = (
+            available_and_reclaimable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
+                + self.tree_cache.reclaimable_size()
             )
-        return available_and_evictable - self.rem_total_token_offset
+        return available_and_reclaimable - self.rem_total_token_offset
 
     @property
     def rem_swa_tokens(self):
         return (
             self.token_to_kv_pool_allocator.swa_available_size()
-            + self.tree_cache.swa_evictable_size()
+            + self.tree_cache.swa_reclaimable_size()
             - self.rem_swa_token_offset
         )
 
     @property
     def cur_rem_tokens(self):
         if self.is_hybrid_swa:
-            available_and_evictable = (
+            available_and_reclaimable = (
                 self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size()
+                + self.tree_cache.full_reclaimable_size()
             )
         elif self.is_hybrid_ssm_cache:
-            available_and_evictable = (
+            available_and_reclaimable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
+                + self.tree_cache.full_reclaimable_size()
             )
         else:
-            available_and_evictable = (
+            available_and_reclaimable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
+                + self.tree_cache.reclaimable_size()
             )
 
-        return available_and_evictable - self.cur_rem_token_offset
+        return available_and_reclaimable - self.cur_rem_token_offset
 
     def _swa_budget_for_req(
         self, extend_input_len: int, swa_host_hit_length: int = 0
