@@ -51,6 +51,7 @@ class SessionSlot:
     last_node: Any = None
     cache_protected_len: int = 0
     swa_uuid_for_lock: Optional[str] = None
+    tree_cache_lock_params: Optional[DecLockRefParams] = None
 
     # SWA state
     swa_evicted_seqlen: int = 0
@@ -78,6 +79,7 @@ class SessionSlot:
             self.last_node = req.last_node
             self.cache_protected_len = req.cache_protected_len
             self.swa_uuid_for_lock = req.swa_uuid_for_lock
+            self.tree_cache_lock_params = req.tree_cache_lock_params
 
         self.mamba_pool_idx = req.mamba_pool_idx
         self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
@@ -93,6 +95,7 @@ class SessionSlot:
         # the req still has a ping-pong buffer and skip alloc, causing
         # the slot's tensor to be reused by a new req and leaked when
         # the slot is later freed.
+        req.tree_cache_lock_params = None
         req.req_pool_idx = None
         req.mamba_pool_idx = None
         req.mamba_ping_pong_track_buffer = None
@@ -309,6 +312,7 @@ class StreamingSession(BasePrefixCache):
                     last_node=req.last_node,
                     cache_protected_len=req.cache_protected_len,
                     swa_uuid_for_lock=req.swa_uuid_for_lock,
+                    tree_cache_lock_params=req.tree_cache_lock_params,
                     mamba_pool_idx=req.mamba_pool_idx,
                     mamba_ping_pong_track_buffer=req.mamba_ping_pong_track_buffer,
                 )
@@ -319,6 +323,7 @@ class StreamingSession(BasePrefixCache):
                 req.mamba_ping_pong_track_buffer = None
             slot.kv_allocated_len = max(slot.kv_allocated_len, req.kv_allocated_len)
             self.release_session(session_id)
+            req.tree_cache_lock_params = None
             req.req_pool_idx = None
             req.session.abort_req()
             self._mark_kv_freed(req)
@@ -418,7 +423,9 @@ class StreamingSession(BasePrefixCache):
         )
 
         if lock_node is not None:
-            if slot.swa_uuid_for_lock is not None:
+            if slot.tree_cache_lock_params is not None:
+                self.inner.dec_lock_ref(lock_node, slot.tree_cache_lock_params)
+            elif slot.swa_uuid_for_lock is not None:
                 self.inner.dec_lock_ref(
                     lock_node,
                     DecLockRefParams(swa_uuid_for_lock=slot.swa_uuid_for_lock),

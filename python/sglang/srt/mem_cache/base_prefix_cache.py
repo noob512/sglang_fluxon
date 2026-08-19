@@ -78,6 +78,10 @@ class InsertResult:
     last_device_node: Any = None
     mamba_exist: bool = False
     inserted_host_node: Any = None
+    # Prefetch slots that duplicated already-resident HostKV. They need to be
+    # returned to the host allocator without assuming duplicates form one
+    # contiguous prefix when storage-only nodes are restored in place.
+    reused_host_indices: Optional[torch.Tensor] = None
 
 
 @dataclasses.dataclass
@@ -105,6 +109,12 @@ class IncLockRefResult:
     delta: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
+    # For a component that skips a bottom tombstone segment, remember the first
+    # node that was actually locked. Release starts at this stable boundary so
+    # a later split/restore below it cannot consume another lock's reference.
+    device_lock_start_nodes: dict[ComponentType, Any] = dataclasses.field(
+        default_factory=dict
+    )
     # Component nodes that were tombstones at acquire time. Replaying this set
     # at release prevents a short-lived lock from consuming a later load-back or
     # request lock after that tombstone becomes a valid device value.
@@ -117,6 +127,7 @@ class IncLockRefResult:
         return DecLockRefParams(
             swa_uuid_for_lock=self.swa_uuid_for_lock,
             swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
+            device_lock_start_nodes=dict(self.device_lock_start_nodes),
             skip_lock_node_ids={
                 component_type: set(node_ids)
                 for component_type, node_ids in self.skip_lock_node_ids.items()
@@ -130,6 +141,9 @@ class DecLockRefParams:
 
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
+    device_lock_start_nodes: dict[ComponentType, Any] = dataclasses.field(
+        default_factory=dict
+    )
     skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
         default_factory=dict
     )
@@ -177,6 +191,10 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
+        storage_metadata_hit_length: Number of prompt tokens whose exact radix path
+                                matched storage-only metadata. These tokens are not L2
+                                hits; L3 lookup is attempted independently from the last
+                                real device/host anchor.
     """
 
     device_indices: torch.Tensor
@@ -188,6 +206,7 @@ class MatchResult(NamedTuple):
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    storage_metadata_hit_length: int = 0
 
 
 def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
@@ -205,6 +224,7 @@ def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
         host_hit_length=0,
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
+        storage_metadata_hit_length=0,
     )
 
 

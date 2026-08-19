@@ -79,6 +79,7 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
     EvictParams,
     MatchPrefixParams,
     zero_match_result,
@@ -858,8 +859,15 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        # Exact prompt tokens matched only by retained radix metadata. This is
+        # an observability/restoration hint, not an L2 hit and not a gate for
+        # whether L3 is queried.
+        self.storage_metadata_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
+        # Exact inverse of the current request tree lock. Device residency can
+        # change during load-back, so release must not recompute this range.
+        self.tree_cache_lock_params: Optional[DecLockRefParams] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
         # The prefix length that is inserted into the tree cache
@@ -1199,6 +1207,7 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
+            self.storage_metadata_hit_length = match_result.storage_metadata_hit_length
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1224,6 +1233,59 @@ class Req(ReqDllmMixin):
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         return max(max_prefix_len, 0)
+
+    def record_storage_hit_tokens(self, loaded_tokens: int) -> None:
+        """Retain storage-prefetch credit until cached-token attribution uses it."""
+        if loaded_tokens < 0:
+            raise ValueError(f"loaded_tokens must be non-negative, got {loaded_tokens}")
+        self.storage_hit_length += loaded_tokens
+
+    def account_cached_tokens_by_source(self, new_cached: int) -> None:
+        """Attribute one cached-token delta while preserving source conservation."""
+        if new_cached < 0:
+            raise RuntimeError(
+                f"cached token count regressed for req={self.rid}: "
+                f"new_cached={new_cached} already_computed={self.already_computed}"
+            )
+        if new_cached == 0:
+            return
+
+        if not self._cache_breakdown_computed:
+            # On the first observed prefix, host_hit_length describes the host
+            # portion of this delta. Storage-prefetched tokens are a subset of
+            # that host portion; any unused storage credit remains available for
+            # a later chunk whose cached prefix grows after load-back completes.
+            host_total = min(max(self.host_hit_length, 0), new_cached)
+            storage_credit = max(
+                self.storage_hit_length - self.cached_tokens_storage, 0
+            )
+            storage_portion = min(host_total, storage_credit)
+            self.cached_tokens_storage += storage_portion
+            self.cached_tokens_host += host_total - storage_portion
+            self.cached_tokens_device += new_cached - host_total
+            self._cache_breakdown_computed = True
+        else:
+            # A chunked request can acquire a deeper cached prefix after its
+            # first chunk. Those tokens came from the retained storage prefetch
+            # credit; once it is exhausted, further reuse is device-local.
+            storage_credit = max(
+                self.storage_hit_length - self.cached_tokens_storage, 0
+            )
+            storage_portion = min(new_cached, storage_credit)
+            self.cached_tokens_storage += storage_portion
+            self.cached_tokens_device += new_cached - storage_portion
+
+        accounted = (
+            self.cached_tokens_device
+            + self.cached_tokens_host
+            + self.cached_tokens_storage
+        )
+        if accounted != self.cached_tokens:
+            raise RuntimeError(
+                f"cached token source mismatch for req={self.rid}: "
+                f"cached={self.cached_tokens} device={self.cached_tokens_device} "
+                f"host={self.cached_tokens_host} storage={self.cached_tokens_storage}"
+            )
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -1446,6 +1508,7 @@ class Req(ReqDllmMixin):
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
+        self.tree_cache_lock_params = None
         self.swa_prefix_lock_released = False
         self.extend_range = None
         self.dllm_initialized = False
@@ -2110,30 +2173,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if not req.retracted_stain:
                 new_cached = pre_len - req.already_computed
                 req.cached_tokens += new_cached
-
-                # Calculate detailed breakdown of cached tokens by source (for HiCache)
-                # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
-                # would incorrectly count previously computed tokens as cache hits.
-                if not req._cache_breakdown_computed:
-                    # At this point, prefix_indices has been extended with host data
-                    # via init_load_back in schedule_policy, so:
-                    # - len(prefix_indices) = device_original + host_loaded
-                    # - host_hit_length = total tokens from host cache (including storage-prefetched)
-                    # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                    # - device_portion = len(prefix_indices) - host_hit_length
-                    #
-                    # Storage hits are now tracked via scheduler after prefetch completes.
-                    # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    host_total = req.host_hit_length
-                    # Clamp storage to host_total to handle edge cases
-                    storage_portion = min(host_total, req.storage_hit_length)
-                    host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
-
-                    req.cached_tokens_device = device_portion
-                    req.cached_tokens_host = host_portion
-                    req.cached_tokens_storage = storage_portion
-                    req._cache_breakdown_computed = True
+                req.account_cached_tokens_by_source(new_cached)
 
                 req.already_computed = seq_len
             req.is_retracted = False

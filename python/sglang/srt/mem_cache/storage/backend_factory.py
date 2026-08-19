@@ -185,6 +185,8 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "simm":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "fluxon":
+            return backend_class(storage_config)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -228,4 +230,10 @@ StorageBackendFactory.register_backend(
     "simm",
     "sglang.srt.mem_cache.storage.simm.hicache_simm",
     "HiCacheSiMM",
+)
+
+StorageBackendFactory.register_backend(
+    "fluxon",
+    "sglang.srt.mem_cache.storage.fluxon.hicache_fluxon",
+    "HiCacheFluxon",
 )

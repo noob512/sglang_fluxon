@@ -1897,7 +1897,7 @@ class ServerArgs:
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix, fluxon. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
                 "mooncake",
@@ -1907,6 +1907,7 @@ class ServerArgs:
                 "dynamic",
                 "eic",
                 "simm",
+                "fluxon",
             ],
         ),
     ] = None
@@ -1921,6 +1922,10 @@ class ServerArgs:
         Optional[str],
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
     ] = None
+    hicache_storage_metadata_capacity: A[
+        int,
+        "Maximum token coverage retained as storage-only radix metadata after HostKV payload eviction. Zero preserves the legacy behavior and deletes radix nodes together with HostKV payloads.",
+    ] = 0
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
@@ -6118,6 +6123,18 @@ class ServerArgs:
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
+        if self.hicache_storage_metadata_capacity < 0:
+            raise ValueError(
+                "--hicache-storage-metadata-capacity must be non-negative."
+            )
+        if (
+            self.hicache_storage_metadata_capacity > 0
+            and self.hicache_storage_backend is None
+        ):
+            raise ValueError(
+                "--hicache-storage-metadata-capacity requires "
+                "--hicache-storage-backend."
+            )
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "

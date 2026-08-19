@@ -3,6 +3,7 @@
 import json
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 from array import array
@@ -653,6 +654,7 @@ class UnifiedRadixCacheSuite:
         req.host_hit_length = match.host_hit_length
         req.swa_host_hit_length = match.swa_host_hit_length
         req.mamba_host_hit_length = match.mamba_host_hit_length
+        req.storage_metadata_hit_length = match.storage_metadata_hit_length
 
     def _make_seq(self, start: int, num_pages: int) -> list[int]:
         """Page-aligned token sequence of num_pages pages."""
@@ -2396,6 +2398,315 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(backend.batch_exists(page_hashes), len(page_hashes))
         tree.sanity_check()
 
+    def test_hicache_storage_metadata_retains_private_path_and_refills_host(self):
+        """L2 eviction keeps an L3-only private suffix and later refills it."""
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("storage-only metadata regression targets Full KV")
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        self._init_hicache(
+            tree,
+            write_policy="write_back",
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+            storage_metadata_capacity=8 * ps,
+        )
+
+        base = self._make_seq(1, 2)
+        suffix = self._make_seq(1000, 2)
+        full = base + suffix
+        self._insert(tree, allocator, req_to_token_pool, base)
+        self._insert(tree, allocator, req_to_token_pool, full)
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", full)))
+        ).last_device_node
+        base_node = leaf.parent
+
+        # Back up only the private suffix. The shared base deliberately stays
+        # device-only, matching the production failure mode.
+        self.assertGreater(tree.write_backup(leaf, write_back=True), 0)
+        tree.writing_check(write_back=True)
+        self._flush_l3_backups(tree)
+        self.assertTrue(leaf.storage_backed)
+        self.assertFalse(base_node.backuped)
+
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_to_host(leaf, tracker)
+        self.assertEqual(tree.evict_host(len(suffix)), len(suffix))
+        self.assertTrue(leaf.storage_only)
+        self.assertEqual(tree.storage_metadata_size_, len(suffix))
+
+        matched = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", full))))
+        self.assertEqual(len(matched.device_indices), len(base))
+        self.assertIs(matched.last_host_node, base_node)
+        self.assertEqual(matched.host_hit_length, 0)
+        self.assertEqual(matched.storage_metadata_hit_length, len(suffix))
+
+        req_id = "storage-only-refill"
+        tree.prefetch_from_storage(
+            req_id,
+            matched.last_host_node,
+            array("q", suffix),
+            matched.last_host_node.get_last_hash_value(),
+            None,
+        )
+        self._run_prefetch_to_completion(tree, req_id)
+        rematched = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", full))))
+        self.assertEqual(rematched.host_hit_length, len(suffix))
+        self.assertEqual(rematched.storage_metadata_hit_length, 0)
+        self.assertFalse(leaf.storage_only)
+        self.assertEqual(tree.storage_metadata_size_, 0)
+        tree.sanity_check()
+
+    def test_hicache_full_match_stops_before_storage_only_host_gap(self):
+        """A host descendant below an L3-only gap is not a load-back boundary."""
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("host-chain regression targets Full KV")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(tree)
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
+        self.assertEqual(len(chain), 3)
+        self._simulate_backup_tree(tree)
+
+        for node in chain:
+            full = node.component_data[ComponentType.FULL]
+            self.assertIsNotNone(full.value)
+            self.assertIsNotNone(full.host_value)
+            full.value = None
+
+        gap = chain[1]
+        gap_full = gap.component_data[ComponentType.FULL]
+        gap_full.host_value = None
+        gap.storage_backed = True
+        self.assertTrue(gap.storage_only)
+        self.assertIsNotNone(chain[2].component_data[ComponentType.FULL].host_value)
+
+        tokens = self._match_tokens_for_chain(chain)
+        matched = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        self.assertIs(matched.best_match_node, chain[0])
+        self.assertIs(matched.last_host_node, chain[0])
+        self.assertEqual(matched.host_hit_length, len(chain[0].key))
+        self.assertEqual(matched.storage_metadata_hit_length, len(gap.key))
+
+        transfer = tree.components[ComponentType.FULL].build_hicache_transfers(
+            matched.best_match_node, CacheTransferPhase.LOAD_BACK
+        )[0]
+        self.assertEqual(len(transfer.host_indices), len(chain[0].key))
+
+    def test_hicache_storage_metadata_capacity_zero_keeps_legacy_delete(self):
+        """The default zero capacity deletes even a fully storage-backed leaf."""
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("storage-only metadata regression targets Full KV")
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(
+            tree,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        self.assertGreater(tree.write_backup(leaf, write_back=True), 0)
+        tree.writing_check(write_back=True)
+        self._flush_l3_backups(tree)
+        self.assertTrue(leaf.storage_backed)
+
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_to_host(leaf, tracker)
+        tree.evict_host(len(seq))
+        self.assertEqual(tree.storage_metadata_size_, 0)
+        self.assertEqual(len(tree.root_node.children), 0)
+        self.assertFalse(leaf.storage_backed)
+        tree.sanity_check()
+
+    def test_hicache_storage_metadata_capacity_trims_lru_leaf(self):
+        """A second storage-only branch deletes the oldest only after overflow."""
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("storage-only metadata regression targets Full KV")
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seqs = [self._make_seq(1, 2), self._make_seq(1000, 2)]
+        self._init_hicache(
+            tree,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+            storage_metadata_capacity=len(seqs[0]),
+        )
+
+        leaves = []
+        for seq in seqs:
+            self._insert(tree, allocator, req_to_token_pool, seq)
+            leaf = tree.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", seq)))
+            ).last_device_node
+            self.assertGreater(tree.write_backup(leaf, write_back=True), 0)
+            tree.writing_check(write_back=True)
+            self._flush_l3_backups(tree)
+            tracker = {ct: 0 for ct in tree.tree_components}
+            tree._evict_to_host(leaf, tracker)
+            tree.evict_host(len(seq))
+            leaves.append(leaf)
+
+        self.assertFalse(leaves[0].storage_metadata_accounted)
+        self.assertTrue(leaves[1].storage_metadata_accounted)
+        self.assertEqual(tree.storage_metadata_size_, len(seqs[1]))
+        self.assertEqual(len(tree.root_node.children), 1)
+        newest = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seqs[1]))))
+        self.assertEqual(newest.storage_metadata_hit_length, len(seqs[1]))
+        tree.sanity_check()
+
+    def test_hicache_storage_metadata_failed_backup_is_not_retained(self):
+        """A partial/failed L3 ACK must keep legacy HostKV deletion semantics."""
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("storage-only metadata regression targets Full KV")
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(
+            tree,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+            storage_metadata_capacity=8 * self.cfg.page_size,
+        )
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+
+        with mock.patch.object(
+            tree.cache_controller, "page_set_func", return_value=False
+        ):
+            self.assertGreater(tree.write_backup(leaf, write_back=True), 0)
+            tree.writing_check(write_back=True)
+            self._flush_l3_backups(tree)
+        self.assertFalse(leaf.storage_backed)
+
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_to_host(leaf, tracker)
+        tree.evict_host(len(seq))
+        self.assertEqual(len(tree.root_node.children), 0)
+        self.assertEqual(tree.storage_metadata_size_, 0)
+        tree.sanity_check()
+
+    def test_hicache_storage_backup_split_publishes_all_fragments(self):
+        """A split during L3 I/O publishes storage backing to both fragments."""
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("storage-only metadata regression targets Full KV")
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(
+            tree,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+            storage_metadata_capacity=8 * self.cfg.page_size,
+        )
+        seq = self._make_seq(1, 4)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+
+        started = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        original_page_set = tree.cache_controller.page_set_func
+
+        def blocked_page_set(*args, **kwargs):
+            started.set()
+            if not release.wait(timeout=5):
+                return False
+            return original_page_set(*args, **kwargs)
+
+        with mock.patch.object(
+            tree.cache_controller, "page_set_func", side_effect=blocked_page_set
+        ):
+            self.assertGreater(tree.write_backup(leaf, write_back=True), 0)
+            tree.writing_check(write_back=True)
+            self.assertTrue(started.wait(timeout=2))
+            query = seq[: 2 * self.cfg.page_size] + self._make_seq(9000, 1)
+            tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", query))))
+            split_parent = next(iter(tree.root_node.children.values()))
+            split_child = next(iter(split_parent.children.values()))
+            self.assertIsNotNone(split_parent.storage_backup_pending_id)
+            self.assertEqual(
+                split_parent.storage_backup_pending_id,
+                split_child.storage_backup_pending_id,
+            )
+            release.set()
+            self._flush_l3_backups(tree)
+
+        self.assertTrue(split_parent.storage_backed)
+        self.assertTrue(split_child.storage_backed)
+        self.assertIsNone(split_parent.storage_backup_pending_id)
+        self.assertIsNone(split_child.storage_backup_pending_id)
+        tree.sanity_check()
+
+    def test_hicache_storage_backup_requires_all_tp_ranks_success(self):
+        """One failed TP rank prevents storage-backed metadata publication."""
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("storage ACK synchronization regression targets Full KV")
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(
+            tree,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+            storage_metadata_capacity=8 * self.cfg.page_size,
+        )
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        self._backup_node(tree, leaf)
+        self.assertTrue(leaf.backuped)
+        tree.write_backup_storage(leaf)
+        self.assertIsNotNone(leaf.storage_backup_pending_id)
+
+        deadline = time.time() + 10
+        while tree.cache_controller.ack_backup_queue.qsize() == 0:
+            self.assertLess(time.time(), deadline, "storage ACK did not arrive")
+            time.sleep(0.01)
+
+        def simulate_failed_peer(tensor, _op):
+            if tensor.ndim == 2 and tensor.shape[1] == 3:
+                tensor[:, 2] = 0
+
+        with mock.patch.object(
+            tree, "_all_reduce_attn_groups", side_effect=simulate_failed_peer
+        ):
+            tree.drain_storage_control_queues()
+
+        self.assertFalse(tree.ongoing_backup)
+        self.assertFalse(leaf.storage_backed)
+        self.assertIsNone(leaf.storage_backup_pending_id)
+        tree.sanity_check()
+
     def test_hicache_l3_prefetch(self):
         """L3 round trip: write with one tree, prefetch into a fresh tree.
 
@@ -2645,6 +2956,7 @@ class UnifiedRadixCacheSuite:
         storage_dir: Optional[str] = None,
         prefetch_threshold: Optional[int] = None,
         prefetch_policy: str = "wait_complete",
+        storage_metadata_capacity: int = 0,
     ):
         import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
@@ -2731,6 +3043,7 @@ class UnifiedRadixCacheSuite:
             hicache_storage_backend=storage_backend,
             hicache_storage_backend_extra_config=storage_extra_config,
             hicache_storage_prefetch_policy=prefetch_policy,
+            hicache_storage_metadata_capacity=storage_metadata_capacity,
         )
         # See build_fixture for why _mamba_cache_chunk_size is preset.
         server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, self.cfg.page_size)
@@ -2830,9 +3143,8 @@ class UnifiedRadixCacheSuite:
             [conv[:, mamba_indices].float().cpu().clone() for conv in mamba_cache.conv],
         )
 
-    def test_hicache_evict_device_leaf_aborts_demote_when_backup_fails(self):
-        """when write_backup cannot allocate host pool,
-        _evict_device_leaf should not evict it to host."""
+    def test_hicache_evict_device_leaf_drops_cache_when_backup_admission_fails(self):
+        """Direct reclaim must free an unlocked leaf even when Host is full."""
         if self._skip_unsupported_hicache_test():
             return
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -2848,15 +3160,23 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(node.evicted)
 
         tracker = {c: 0 for c in tree.tree_components}
+        available_before = allocator.available_size()
         with mock.patch.object(tree, "write_backup", return_value=0):
             tree._evict_device_leaf(node, tracker)
 
-        self.assertFalse(node.evicted)
-        self.assertIsNotNone(node.component_data[ct].value)
+        self.assertTrue(node.evicted)
+        self.assertIsNone(node.component_data[ct].value)
         self.assertIsNone(node.component_data[ct].host_value)
-
-        with self.assertRaises(AssertionError):
-            tree._evict_to_host(node, {c: 0 for c in tree.tree_components})
+        self.assertGreater(tracker[ct], 0)
+        self.assertEqual(
+            tree.hard_reclaim_writeback_drop_tokens_total,
+            tracker[ct],
+        )
+        self.assertEqual(
+            allocator.available_size() - available_before,
+            tracker[ct],
+        )
+        self.assertNotIn(node, tree.evictable_device_leaves)
 
         tree.sanity_check()
 
@@ -4000,7 +4320,7 @@ class UnifiedRadixCacheSuite:
         ps = self.cfg.page_size
         if 3 * ps > self.cfg.kv_size // 2:
             self.skipTest("kv_size too small")
-        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
             self.skipTest("chain too short")
@@ -4040,6 +4360,83 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(cd_anchor.lock_ref, 0)
         self.assertEqual(cd_y.lock_ref, 0)
         self.assertEqual(cd_a.lock_ref, 0)
+
+    def test_hicache_full_temp_lock_does_not_steal_request_lock_after_split(self):
+        """A lock that skipped a tombstone must not acquire a later split.
+
+        The split parent did not exist when ``temp_lock`` was acquired.  Once
+        both fragments are restored, its positive ref belongs only to the
+        request lock.  Releasing the temporary lock must leave that ref alone.
+        """
+        if self.cfg.components != (ComponentType.FULL,):
+            self.skipTest("isolates Full component lock ownership")
+        ps = self.cfg.page_size
+        if 4 * ps > self.cfg.kv_size // 2:
+            self.skipTest("kv_size too small")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        base = self._make_seq(1, 1)
+        suffix = self._make_seq(10_000, 3)
+        self._insert(tree, allocator, req_to_token_pool, base)
+        self._insert(tree, allocator, req_to_token_pool, base + suffix)
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", base + suffix)))
+        )
+        leaf = match.last_device_node
+        ancestor = leaf.parent
+        self.assertIsNot(ancestor, tree.root_node)
+        self.assertEqual(len(leaf.key), 3 * ps)
+        self._simulate_backup_tree(tree)
+
+        leaf_cd = leaf.component_data[ComponentType.FULL]
+        leaf_value = leaf_cd.value
+        self.assertIsNotNone(leaf_value)
+        tree.component_evictable_size_[ComponentType.FULL] -= len(leaf_value)
+        leaf_cd.value = None
+        tree._update_evictable_leaf_sets(leaf)
+        tree._update_evictable_leaf_sets(ancestor)
+
+        temp_lock = tree.inc_lock_ref(leaf)
+        self.assertIn(
+            leaf.id, temp_lock.skip_lock_node_ids[ComponentType.FULL]
+        )
+        self.assertEqual(leaf_cd.lock_ref, 0)
+        self.assertEqual(
+            ancestor.component_data[ComponentType.FULL].lock_ref, 1
+        )
+
+        split_parent = tree._split_node(leaf.key, leaf, ps)
+        split_cd = split_parent.component_data[ComponentType.FULL]
+        self.assertEqual(split_cd.lock_ref, 0)
+
+        split_cd.value = leaf_value[:ps].clone()
+        leaf_cd.value = leaf_value[ps:].clone()
+        tree.component_evictable_size_[ComponentType.FULL] += len(leaf_value)
+        tree._update_evictable_leaf_sets(split_parent)
+        tree._update_evictable_leaf_sets(leaf)
+        tree._update_evictable_leaf_sets(ancestor)
+
+        request_lock = tree.inc_lock_ref(leaf)
+        self.assertEqual(leaf_cd.lock_ref, 1)
+        self.assertEqual(split_cd.lock_ref, 1)
+        self.assertEqual(
+            ancestor.component_data[ComponentType.FULL].lock_ref, 2
+        )
+
+        tree.dec_lock_ref(leaf, temp_lock.to_dec_params())
+        self.assertEqual(leaf_cd.lock_ref, 1)
+        self.assertEqual(split_cd.lock_ref, 1)
+        self.assertEqual(
+            ancestor.component_data[ComponentType.FULL].lock_ref, 1
+        )
+
+        tree.dec_lock_ref(leaf, request_lock.to_dec_params())
+        self.assertEqual(leaf_cd.lock_ref, 0)
+        self.assertEqual(split_cd.lock_ref, 0)
+        self.assertEqual(
+            ancestor.component_data[ComponentType.FULL].lock_ref, 0
+        )
+        tree.sanity_check()
 
     def test_hicache_mamba_temp_lock_does_not_release_restored_tombstone(self):
         """A temporary scheduler lock that skipped a Mamba tombstone must not
