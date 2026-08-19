@@ -43,6 +43,7 @@ class HiCacheStorageConfig:
 class HiCacheStorageExtraInfo:
     prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
+    atomic_group_lens: Optional[List[int]] = None
 
 
 @dataclass(frozen=True)

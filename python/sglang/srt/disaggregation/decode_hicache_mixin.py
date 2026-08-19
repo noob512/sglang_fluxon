@@ -61,8 +61,9 @@ class DecodeHiCachePreallocMixin:
     def _build_decode_prefix_match(self, req: Req, result: Any) -> DecodePrefixMatch:
         """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
 
-        Performs the optional L3 storage hit length query when decode-side
-        HiCache is enabled and the last host node is backed up.
+        Performs a best-effort L3 storage hit length query whenever decode-side
+        HiCache is enabled. The local match chooses the hash anchor but does
+        not gate the lookup.
         """
         prefix_indices = result.device_indices
         l1_prefix_len = len(prefix_indices)
@@ -72,21 +73,20 @@ class DecodeHiCachePreallocMixin:
         last_host_node = None
         if self.scheduler.enable_decode_hicache:
             last_host_node = result.last_host_node
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
-                matched_len = l1_prefix_len + l2_host_hit_length
-                suffix_tokens = req.origin_input_ids[matched_len:]
-                last_hash = last_host_node.get_last_hash_value()
-                prefix_keys = (
-                    last_host_node.get_prefix_hash_values(last_host_node.parent)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
-                    else None
-                )
-                l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
-                    last_host_node,
-                    suffix_tokens,
-                    last_hash,
-                    prefix_keys,
-                )
+            matched_len = l1_prefix_len + l2_host_hit_length
+            suffix_tokens = req.origin_input_ids[matched_len:]
+            last_hash = last_host_node.get_last_hash_value()
+            prefix_keys = (
+                last_host_node.get_prefix_hash_values(last_host_node.parent)
+                if self.tree_cache.hicache_storage_pass_prefix_keys
+                else None
+            )
+            l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
+                last_host_node,
+                suffix_tokens,
+                last_hash,
+                prefix_keys,
+            )
 
         return DecodePrefixMatch(
             prefix_indices=prefix_indices,
