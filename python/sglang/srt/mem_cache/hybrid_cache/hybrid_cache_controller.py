@@ -232,6 +232,7 @@ class HybridCacheController(BaseHiCacheController):
     @staticmethod
     def parse_storage_backend_extra_config(
         storage_backend_extra_config: Optional[str],
+        storage_backend: str,
     ) -> tuple[dict, int, float, float, bool]:
         extra_config = {}
         if storage_backend_extra_config:
@@ -255,6 +256,19 @@ class HybridCacheController(BaseHiCacheController):
                         )
             else:
                 extra_config = json.loads(storage_backend_extra_config)
+
+        if not isinstance(extra_config, dict):
+            raise ValueError(
+                "Storage backend extra config must decode to a dictionary, got "
+                f"{type(extra_config).__name__}"
+            )
+        if str(storage_backend).lower() == "fluxon":
+            config_keys = set(extra_config)
+            if config_keys != {"config_path"}:
+                raise ValueError(
+                    "Fluxon HiCache extra config must contain exactly one field: "
+                    "'config_path'"
+                )
 
         prefetch_threshold = extra_config.pop("prefetch_threshold", 256)
         prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)
